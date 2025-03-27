@@ -20,7 +20,7 @@ This code simulates stealthy cyberattacks against water distribution networks, f
 1. **Setup:**
    - Ensure MATLAB (with the Optimization Toolbox) and the EPANET-MATLAB toolkit are installed.
    - Place all the files in one directory along with the EPANET input file (`Net1.inp`).
-   - 
+     
 2. **Run the Simulation:**
    - Open MATLAB and navigate to the repository directory.
    - Execute the main script: `FS_FDI_Net1`
