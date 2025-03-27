@@ -20,6 +20,7 @@ This code simulates stealthy cyberattacks against water distribution networks, f
 1. **Setup:**
    - Ensure MATLAB (with the Optimization Toolbox) and the EPANET-MATLAB toolkit are installed.
    - Place all the files in one directory along with the EPANET input file (`Net1.inp`).
+   - Gurobi Optimizer installed and licensed.
      
 2. **Run the Simulation:**
    - Open MATLAB and navigate to the repository directory.
@@ -28,7 +29,7 @@ This code simulates stealthy cyberattacks against water distribution networks, f
 
 3. **Customization:**
    - Modify attack parameters (e.g., `attack_magnitude`, `att_start`, `att_end`) in `FS_FDI_Net1.m` to test different scenarios.
-   - To simulate other attack types (HA-FDI, HU-FDI, R-FDI), adjust the corresponding sections in the code.
+   - To simulate other attack types (HA-FDI, HU-FDI, R-FDI), uncomment/comment the corresponding constraints in the optimization formulation
 
 ## Notes
 - The current implementation is focused on the FS-FDI attack for research purposes. Future updates will include a more generalized implementation covering all attack types and larger network scenarios.
