@@ -236,7 +236,7 @@ for tH = 1:24
     TrueState.ObjectiveValue(tH+1) = value(HydOptObjectiveFunction)*ConfigurationConstants.GPMperCFS*kwh_price;
 
     %% Generate Measurements from normal operation
-    flow_noise_std = 0.015;
+    flow_noise_std = 0.025;
     head_noise_std = 0.15;
     % Generate from true state
     [MeasuredFlows, MeasuredHeads] = generateNoisyMeasurements(TrueState.PipeFlow(tH+1,:), ...
@@ -267,7 +267,7 @@ for tH = 1:24
     MeasuredData = All_Data(active_sensors);
 
     %% FS-FDI Attack Implementation
-    FS_FDI_active= 1;
+    FS_FDI_active= 0;
     if FS_FDI_active == 1 && tH >= att_start && tH <= att_end
         % Create FDI variables
         FDI_vector = sdpvar(length(MeasuredData), 1);
@@ -362,11 +362,11 @@ for tH = 1:24
             upNode = LinkFromTo(pp2,1);
             dnNode = LinkFromTo(pp2,2);
             if upNode <= JunctionCount && dnNode <= JunctionCount
-                slopeVal = PipesLinSegmSlope(1, pp2); 
+                slopeVal = PipesLinSegmSlope(1, pp2);
                 rowVec = zeros(1, PipeCount + JunctionCount);
                 rowVec(PipeCount+upNode) = +1;
                 rowVec(PipeCount+dnNode) = -1;
-                rowVec(pp2)            = -slopeVal;   
+                rowVec(pp2)            = -slopeVal;
                 H_energy = [H_energy; rowVec];
                 z_energy = [z_energy; 0];
             end
@@ -431,6 +431,7 @@ for tH = 1:24
 
     for jJ = 1:JunctionCount
         dmd = JunctionDemand24(tH, jJ);
+        % z_mass(jJ) = dmd * (1 + epsilon_demand(jJ));
         z_mass(jJ) = dmd;
         % sign convention: outflows are +, inflows are –
         for pp2 = 1:PipeCount
@@ -453,10 +454,15 @@ for tH = 1:24
     H_energy = [];
     z_energy = [];
 
+    % Introduce a small variability in pipe roughness (5% standard deviation)
+    sigma_roughness = 0.15;
+    delta_roughness = sigma_roughness * randn(PipeCount, 1);  % One value per pipe
+
     for pp2 = 1:PipeCount
         upNode = LinkFromTo(pp2,1);
         dnNode = LinkFromTo(pp2,2);
         if upNode <= JunctionCount && dnNode <= JunctionCount
+            % slopeVal = PipesLinSegmSlope(1, pp2)*(1 + delta_roughness(pp2));
             slopeVal = PipesLinSegmSlope(1, pp2);
             rowVec = zeros(1, PipeCount + JunctionCount);
             rowVec(PipeCount+upNode) = +1;
@@ -472,8 +478,12 @@ for tH = 1:24
     %-----------
     % 4) Combine everything
     %-----------
-    H_system = [H_meas; H_massW; H_energyW];
-    z_system = [z_meas; z_massW; z_energyW];
+    H_system = [H_meas;
+        H_massW;
+        H_energyW];
+    z_system = [z_meas;
+        z_massW;
+        z_energyW];
 
     %-----------
     % 5) Solve
@@ -484,9 +494,10 @@ for tH = 1:24
     EstimatedStatesOverTime = [EstimatedStatesOverTime, EstimatedStates];
     MeasuredDataOverTime = [MeasuredDataOverTime, MeasuredData];
 
-    % resid  = All_Data - EstimatedStates;
-    % rmse   = sqrt(mean(resid.^2));
-    % fprintf('Time step %d - WLS: final RMSE=%.4f\n', tH, rmse);
+    true_state = [TrueState.PipeFlow.'; TrueState.JunctionHead.'];
+    resid  =  true_state(:,tH+1) - EstimatedStates;
+    rmse   = sqrt(mean(resid.^2));
+    fprintf('Time step %d - WLS: final RMSE=%.4f\n', tH, rmse);
 
 
     %% Perceived System Optimization
@@ -752,8 +763,307 @@ results.Time_OptProb = Time_OptProb;
 
 save('attack_simulation_results.mat', 'results');
 
+
+%% plotWLSPerformance.m
+% This script evaluates the performance of the WLS state estimation
+% using our FS_FDI_Net1 SE setup. We vary the flow measurement noise,
+% compare true vs. estimated state trajectories, and study RMSE versus
+% additional demand noise.
+%
+% Make sure to run FS_FDI_Net1.m first so that all required variables
+% are available in the workspace.
+
+%% Experiment 1 (Revised): RMSE vs. Flow Measurement Noise Over 24 Hours
+
+% Define a range of flow measurement noise levels (GPM):
+noiseLevels = linspace(0.001, 0.1, 25);
+rmseArray = zeros(length(noiseLevels), 1);
+
+head_noise_std_fixed = 0.15;   % Keep head noise fixed
+numStates = PipeCount + JunctionCount;  % e.g., if we estimate [PipeFlows; JunctionHeads]
+
+for i = 1:length(noiseLevels)
+    current_flow_noise_std = noiseLevels(i);
+
+    % We'll store the differences (Estimated - True) across all 24 hours:
+    differenceMatrix = zeros(numStates, 24);
+
+    % Run through each hour in the 24-hour horizon:
+    for tH = 1:24
+        % (A) Generate noisy measurements for flows & heads at time tH:
+        [MeasuredFlows, MeasuredHeads] = generateNoisyMeasurements(...
+            TrueState.PipeFlow(tH+1,:), ...
+            TrueState.JunctionHead(tH+1,:), ...
+            current_flow_noise_std, ...
+            head_noise_std_fixed);
+
+        All_Data = [MeasuredFlows(:); MeasuredHeads(:)];
+        num_flows = length(MeasuredFlows);
+        num_heads = length(MeasuredHeads);
+
+        % (B) Extract only the active sensors for this scenario:
+        MeasuredData = All_Data(active_sensors);
+
+        % (C) Build direct measurement sub-block (H_direct):
+        numMeas = length(MeasuredData);
+        H_direct = zeros(numMeas, numStates);  % #rows = #meas, #cols = PipeCount+JunctionCount
+        for iM = 1:numMeas
+            globalIndex = active_sensors(iM);
+            if globalIndex <= num_flows
+                % It's a pipe flow sensor
+                H_direct(iM, globalIndex) = 1;
+            else
+                % It's a head sensor => shift by num_flows
+                juncIdx = globalIndex - num_flows;
+                H_direct(iM, PipeCount + juncIdx) = 1;
+            end
+        end
+
+        % (D) Build weighting matrix W_meas:
+        flow_weights = (1 / (current_flow_noise_std^2)) * ones(num_flows,1);
+        head_weights = (1 / (head_noise_std_fixed^2)) * ones(num_heads,1);
+        full_weights = [flow_weights; head_weights];
+        activeWeights = full_weights(active_sensors);
+        W_meas = diag(activeWeights);
+
+        % Weighted measurement matrix and vector:
+        H_meas = sqrt(W_meas) * H_direct;
+        z_meas = sqrt(W_meas) * MeasuredData;
+
+        % (E) Build mass-balance constraints for each junction:
+        H_mass = zeros(JunctionCount, numStates);
+        z_mass = zeros(JunctionCount,1);
+        for jJ = 1:JunctionCount
+            dmd = JunctionDemand24(tH, jJ);
+            z_mass(jJ) = dmd;
+            % sign convention: outflows are +, inflows are –
+            for pp2 = 1:PipeCount
+                if LinkFromTo(pp2,2) == jJ
+                    H_mass(jJ, pp2) = -1;
+                elseif LinkFromTo(pp2,1) == jJ
+                    H_mass(jJ, pp2) = +1;
+                end
+            end
+        end
+        H_massW = H_mass;
+        z_massW = z_mass;
+
+        % (F) Build energy sub-block (using a single slope per pipe):
+        H_energy = [];
+        z_energy = [];
+        for pp2 = 1:PipeCount
+            upNode = LinkFromTo(pp2,1);
+            dnNode = LinkFromTo(pp2,2);
+            if upNode <= JunctionCount && dnNode <= JunctionCount
+                slopeVal = PipesLinSegmSlope(1, pp2);
+                rowVec = zeros(1, numStates);
+                rowVec(PipeCount + upNode) = +1;
+                rowVec(PipeCount + dnNode) = -1;
+                rowVec(pp2) = -slopeVal;  % minus slope * flow
+                H_energy = [H_energy; rowVec];
+                z_energy = [z_energy; 0];
+            end
+        end
+        H_energyW = H_energy;
+        z_energyW = z_energy;
+
+        % (G) Combine everything into one system of equations:
+        H_system = [H_meas; H_massW; H_energyW];
+        z_system = [z_meas; z_massW; z_energyW];
+
+        % (H) Solve the WLS estimate:
+        EstimatedStates = (H_system' * H_system) \ (H_system' * z_system);
+
+        % (I) Compute the difference from the true state at hour tH:
+        % The true state is [PipeFlow; JunctionHead] at time tH+1
+        x_true = [TrueState.PipeFlow(tH+1,:)'; TrueState.JunctionHead(tH+1,:)'];
+        differenceMatrix(:, tH) = EstimatedStates - x_true;
+    end  % end for tH
+
+    % After all 24 hours, compute the overall RMSE for this noise level:
+    rmseArray(i) = sqrt(mean(differenceMatrix(:).^2));
+end
+
+% Plot the final RMSE vs. noise level
+figure('Position',[100 100 800 400]);
+plot(noiseLevels, rmseArray, 'bo-', 'LineWidth', 2, 'MarkerSize',5);
+xlabel('Flow Measurement Noise Std (GPM)');
+ylabel('RMSE');
+title('Overall WLS RMSE vs. Flow Noise');
+grid on;
+set(gcf, 'Color', 'white');
+
+
+%% Experiment 2: RMSE vs. Additional Demand Noise Over 24 Hours
+numRuns2 = 50;  % Number of demand noise levels to test
+demandNoiseLevels = linspace(0.01, 0.25, numRuns2);
+rmseDemandArray = zeros(numRuns2, 1);
+
+% For each demand noise level:
+for i = 1:numRuns2
+    current_demand_noise_std = demandNoiseLevels(i);
+
+    % We'll store the (Estimated - True) differences for all 24 hours:
+    differenceMatrix_demand = zeros(PipeCount + JunctionCount, 24);
+
+    % Loop over each hour in the 24-hour horizon:
+    for tH = 1:24
+        % (A) Generate the normal noisy flow/head measurements
+        %     (Flow and Head noise remain the same as in your base code)
+        [MeasuredFlows, MeasuredHeads] = generateNoisyMeasurements( ...
+            TrueState.PipeFlow(tH+1,:), ...
+            TrueState.JunctionHead(tH+1,:), ...
+            flow_noise_std, ...
+            head_noise_std);
+
+        All_Data = [MeasuredFlows(:); MeasuredHeads(:)];
+        num_flows = length(MeasuredFlows);
+        num_heads = length(MeasuredHeads);
+
+        % (B) Extract only the active sensors
+        MeasuredData = All_Data(active_sensors);
+
+        % (C) Build direct measurement sub-block
+        numMeas = length(MeasuredData);
+        H_direct = zeros(numMeas, PipeCount + JunctionCount);
+        for iM = 1:numMeas
+            globalIndex = active_sensors(iM);
+            if globalIndex <= num_flows
+                % It's a pipe flow sensor
+                H_direct(iM, globalIndex) = 1;
+            else
+                % It's a head sensor => shift index
+                juncIdx = globalIndex - num_flows;
+                H_direct(iM, PipeCount + juncIdx) = 1;
+            end
+        end
+
+        % (D) Weight matrix
+        flow_weights = (1 / (flow_noise_std^2)) * ones(num_flows,1);
+        head_weights = (1 / (head_noise_std^2)) * ones(num_heads,1);
+        full_weights = [flow_weights; head_weights];
+        activeWeights = full_weights(active_sensors);
+        W_meas = diag(activeWeights);
+
+        % Weighted measurement matrix/vector
+        H_meas = sqrt(W_meas) * H_direct;
+        z_meas = sqrt(W_meas) * MeasuredData;
+
+        % (E) Build mass-balance constraints with "extra" demand noise
+        %     This is where we add the random perturbation for each junction
+        H_mass = zeros(JunctionCount, PipeCount + JunctionCount);
+        z_mass = zeros(JunctionCount,1);
+
+        % Generate random demand noise for each junction at hour tH
+        demand_perturb = current_demand_noise_std * randn(JunctionCount,1);
+
+        for jJ = 1:JunctionCount
+            % The original (base) demand
+            dmd_base = JunctionDemand24(tH, jJ);
+
+            % Additional random factor
+            dmd_noisy = dmd_base * (1 - demand_perturb(jJ));
+            z_mass(jJ) = dmd_noisy;
+
+            % sign convention: outflows are +, inflows are –
+            for pp2 = 1:PipeCount
+                if LinkFromTo(pp2,2) == jJ
+                    H_mass(jJ, pp2) = -1;
+                elseif LinkFromTo(pp2,1) == jJ
+                    H_mass(jJ, pp2) = +1;
+                end
+            end
+        end
+        H_massW = H_mass;
+        z_massW = z_mass;
+
+        % (F) Build energy sub-block
+        H_energy = [];
+        z_energy = [];
+        for pp2 = 1:PipeCount
+            upNode = LinkFromTo(pp2,1);
+            dnNode = LinkFromTo(pp2,2);
+            if upNode <= JunctionCount && dnNode <= JunctionCount
+                slopeVal = PipesLinSegmSlope(1, pp2);
+                rowVec = zeros(1, PipeCount + JunctionCount);
+                rowVec(PipeCount + upNode) = +1;
+                rowVec(PipeCount + dnNode) = -1;
+                rowVec(pp2) = -slopeVal;
+                H_energy = [H_energy; rowVec];
+                z_energy = [z_energy; 0];
+            end
+        end
+        H_energyW = H_energy;
+        z_energyW = z_energy;
+
+        % (G) Combine the blocks
+        H_system = [H_meas; H_massW; H_energyW];
+        z_system = [z_meas; z_massW; z_energyW];
+
+        % (H) Solve the WLS estimate
+        EstimatedStates = (H_system' * H_system) \ (H_system' * z_system);
+
+        % (I) True state at time tH
+        x_true = [TrueState.PipeFlow(tH+1,:)'; TrueState.JunctionHead(tH+1,:)'];
+
+        % (J) Store the difference for this hour
+        differenceMatrix_demand(:, tH) = EstimatedStates - x_true;
+    end
+
+    % After finishing all 24 hours, compute overall RMSE for the entire day:
+    rmseDemandArray(i) = sqrt(mean(differenceMatrix_demand(:).^2));
+end
+
+% Plot the final RMSE vs. demand noise level
+figure('Position',[100 100 800 400]);
+plot(demandNoiseLevels, rmseDemandArray, 'ms-', 'LineWidth',2,'MarkerSize',5);
+xlabel('Additional Demand Noise Std');
+ylabel('RMSE');
+title('Overall WLS RMSE vs. Demand Noise');
+grid on;
+set(gcf, 'Color', 'white');
+
+
+%% Experiment 3: Comparison of Selected Unmeasured State Trajectories
+% Combine true pipe flows and junction heads into one full state vector.
+% For Net1, TrueState.PipeFlow is [time x PipeCount] and
+% TrueState.JunctionHead is [time x JunctionCount]. We transpose them
+% so that the full true state matrix has size (PipeCount+JunctionCount) x time.
+TrueStateFull = [TrueState.PipeFlow.'; TrueState.JunctionHead.'];
+
+% Define the selected state indices and their labels.
+% For Net1, assume PipeCount = 12, JunctionCount = 9.
+selected_indices = [2, 4, 12, 14];  % [Pipe 4, Pipe 8, Pipe 10, Junction 2 head]
+state_labels = {'Pipe 2 Flow (GPM)', 'Pipe 4 Flow (GPM)', 'Pipe 12 Flow (GPM)', 'Junction 2 Head (ft)'};
+
+% Create a time vector (assuming simulation time steps 0:24)
+time_vector = 1:24;  % e.g., 0 to 24
+
+% Create a figure with a 2x2 grid for the selected states.
+figure('Position', [100, 100, 1000, 800]);
+for i = 1:length(selected_indices)
+    subplot(2,2,i)
+    idx = selected_indices(i);
+
+    % Plot the true state trajectory.
+    plot(time_vector, TrueStateFull(idx,2:25), 'b-', 'LineWidth', 2, 'DisplayName', 'True');
+    hold on;
+
+    % Plot the estimated state trajectory.
+    plot(time_vector, EstimatedStatesOverTime(idx,:), 'r--', 'LineWidth', 2, 'DisplayName', 'Estimated');
+
+    xlabel('Time (hours)');
+    ylabel(state_labels{i});
+    title(['Comparison: ' state_labels{i}]);
+    legend('Location', 'best');
+    grid on;
+end
+sgtitle('Selected Unmeasured State Trajectories: True vs. Estimated');
+
+
+
 %% Plotting
-plot_active = 1;
+plot_active = 0;
 if plot_active == 1
 
     %% Clear workspace and set up plotting defaults
@@ -1063,15 +1373,11 @@ end
 
 %% Generating noisy measurements function
 function [MeasuredFlows, MeasuredHeads] = generateNoisyMeasurements(TruePipeFlow, TrueJunctionHead, flow_noise_std, head_noise_std)
-% Set the random seed for reproducible noise
-rng(1);  % Change the seed to get different fixed noise patterns
-
 % Generate fixed noise for flows and heads
 flow_noise = flow_noise_std * randn(size(TruePipeFlow)) + 0.4 * rand(size(TruePipeFlow));
 head_noise = head_noise_std * randn(size(TrueJunctionHead)) + 0.4 * rand(size(TrueJunctionHead));
 
 % Generate noisy measurements based on the provided noise standard deviations
-flow_noise(1)=0;
 MeasuredFlows = TruePipeFlow + flow_noise;
 MeasuredHeads = TrueJunctionHead + head_noise;
 end
